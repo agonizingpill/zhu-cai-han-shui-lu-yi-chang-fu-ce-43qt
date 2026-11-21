@@ -15,6 +15,16 @@
 - 异常批次 `AnomalyLot`：持久化 OneClassSVM 判定、标准化距离、模型 checksum 和隔离状态。
 - 窑干复测 `KilnRecheck`：记录窑位时间窗，冲突时创建 `RESCHEDULED` 版本并保留原排程。
 - 出库放行 `ReleaseDecision`：只有 supervisor 能盖章，异常复测未闭环时后端拒绝放行。
+- 校准追查 `InstrumentCalibration` / `CalibrationTrace`：主管登记「仪器 + 读偏时段」后，追查实际读过这些读数的初检（含训练参考样本），受影响或来源不可查的批次暂停出库。
+
+## 校准追查口径
+
+1. 送检时固化来源：`analysis_jobs` 通过 `analysis_job_samples` 记录本次实际读到的测点，通过 `analysis_job_references` 记录训练参考批次。
+2. 主管 `POST /calibrations` 登记校准事件；系统按「仪器一致且采样时间落在时段内」找出受影响读数。
+3. 追溯范围：自身读数进入过的初检、把受影响批次当训练参考的初检，以及用了该仪器却没留下来源证据的旧初检（记为 `UNTRACEABLE`）。
+4. 处置：已出库批次记 `RELEASED_KEPT` 保留原决定；未出库批次暂停出库，可信测点（排除所有 `ACTIVE` 校准时段后的读数）达到 4 点时生成 `RECOMPUTE` 任务重算，不足则 `HELD` 继续扣留。
+5. 登记生效时仍在排队/运行的初检被标记 `BLOCKED`，不会再用这段读数给批次放行。
+6. `calibration_traces` 以 `(calibration_id, lot_id)` 唯一，重试只更新不新增；已闭环记录不会被重试打回。追查原因在批次详情和校准追查页可见。
 
 ## 算法口径
 

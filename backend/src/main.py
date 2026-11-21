@@ -1,12 +1,15 @@
 import json, os
+from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from psycopg2.extras import RealDictCursor
 from .utils.db import conn, one, all_rows
 from .utils.security import hp, token, user, roles
 from .config.settings import MIN_SAMPLE_POINTS
 from .services.queue import put
+from .services import calibration as calib
 from .middlewares.audit import AuditMiddleware
 from .middlewares.rate_limit import RateLimitMiddleware
 
@@ -21,12 +24,15 @@ class SampleIn(BaseModel): point_code:str; moisture_pct:float=Field(ge=0,le=100)
 class ScheduleIn(BaseModel): kiln_code:str; scheduled_start:str; scheduled_end:str
 class ResultIn(BaseModel): post_moisture:float=Field(ge=0,le=100); result:str; notes:str=''
 class ReleaseIn(BaseModel): decision:str; reason:str
+class CalibrationIn(BaseModel): instrument_id:str; window_start:str; window_end:str; reason:str
 
 def detail(lot_id):
     l=one('SELECT * FROM bamboo_lots WHERE id=%s',(lot_id,))
     if not l: raise HTTPException(404,'竹材批次不存在')
     ss=all_rows('SELECT * FROM moisture_samples WHERE lot_id=%s ORDER BY point_code',(lot_id,)); a=one('SELECT * FROM anomaly_lots WHERE lot_id=%s',(lot_id,))
-    return {'lot':dict(l),'samples':[dict(x) for x in ss],'anomaly':dict(a) if a else None}
+    traces=all_rows("SELECT t.*,c.instrument_id,c.window_start,c.window_end,c.status calibration_status FROM calibration_traces t JOIN instrument_calibrations c ON c.id=t.calibration_id WHERE t.lot_id=%s ORDER BY t.updated_at DESC,t.id DESC",(lot_id,))
+    rels=all_rows('SELECT decision,reason,decided_at FROM release_decisions WHERE lot_id=%s ORDER BY id DESC',(lot_id,))
+    return {'lot':dict(l),'samples':[dict(x) for x in ss],'anomaly':dict(a) if a else None,'calibration_traces':[dict(x) for x in traces],'releases':[dict(x) for x in rels]}
 
 def reference_vectors(exclude):
     rows=all_rows("SELECT l.id,array_agg(s.moisture_pct ORDER BY s.point_code) vals FROM bamboo_lots l JOIN moisture_samples s ON s.lot_id=l.id LEFT JOIN anomaly_lots a ON a.lot_id=l.id WHERE l.id<>%s AND a.id IS NULL GROUP BY l.id HAVING count(s.id)>=%s",(exclude,MIN_SAMPLE_POINTS))
@@ -92,10 +98,24 @@ def sample(lot_id:int,d:SampleIn,u=Depends(roles('operator','supervisor'))):
 def analyze(lot_id:int,u=Depends(roles('operator','supervisor'))):
     d=detail(lot_id); n=len(d['samples'])
     if n<MIN_SAMPLE_POINTS: raise HTTPException(409,f'采样点不足，至少需要 {MIN_SAMPLE_POINTS} 个测点，当前 {n} 个')
+    refs=all_rows("SELECT l.id FROM bamboo_lots l JOIN moisture_samples s ON s.lot_id=l.id LEFT JOIN anomaly_lots a ON a.lot_id=l.id WHERE l.id<>%s AND a.id IS NULL GROUP BY l.id HAVING count(s.id)>=%s",(lot_id,MIN_SAMPLE_POINTS))
     with conn() as c:
-        with c.cursor() as cur:
-            cur.execute('INSERT INTO analysis_jobs(lot_id,input_summary) VALUES(%s,%s) RETURNING id',(lot_id,json.dumps({'sample_count':n,'points':[s['point_code'] for s in d['samples']]})))
-            jid=cur.fetchone()[0]
+        with c.cursor(cursor_factory=RealDictCursor) as cur:
+            # 若该批次仍有未闭环的校准扣留，重新送检即为按可信读数重算，直接闭环原追查记录。
+            cur.execute("SELECT calibration_id FROM calibration_traces WHERE lot_id=%s AND disposition IN('RECOMPUTING','HELD') ORDER BY id DESC LIMIT 1",(lot_id,))
+            pending=cur.fetchone()
+            cid=pending['calibration_id'] if pending else None
+            if cid:
+                cur.execute("INSERT INTO analysis_jobs(lot_id,kind,calibration_id,input_summary,provenance_captured) VALUES(%s,'RECOMPUTE',%s,%s,true) RETURNING id",(lot_id,cid,json.dumps({'sample_count':n,'points':[s['point_code'] for s in d['samples']],'reason':'reanalyze'})))
+            else:
+                cur.execute('INSERT INTO analysis_jobs(lot_id,input_summary,provenance_captured) VALUES(%s,%s,true) RETURNING id',(lot_id,json.dumps({'sample_count':n,'points':[s['point_code'] for s in d['samples']]})))
+            jid=cur.fetchone()['id']
+            # 固化初检实际读到的测点与训练参考批次，供校准事件追溯。
+            for s in d['samples']: cur.execute('INSERT INTO analysis_job_samples(job_id,sample_id) VALUES(%s,%s) ON CONFLICT DO NOTHING',(jid,s['id']))
+            for r in refs: cur.execute('INSERT INTO analysis_job_references(job_id,reference_lot_id) VALUES(%s,%s) ON CONFLICT DO NOTHING',(jid,r['id']))
+            if cid:
+                cur.execute("UPDATE analysis_jobs SET calibration_id=%s WHERE id=%s",(cid,jid))
+                cur.execute("UPDATE calibration_traces SET job_id=%s,updated_at=now() WHERE lot_id=%s AND calibration_id=%s AND disposition IN('RECOMPUTING','HELD')",(jid,lot_id,cid))
     put(jid); return {'job_id':jid,'status':'QUEUED'}
 
 @app.get('/anomalies')
@@ -126,7 +146,7 @@ def recheck_result(aid:int,d:ResultIn,u=Depends(roles('operator','supervisor')))
         with c.cursor() as cur:
             cur.execute("UPDATE kiln_rechecks SET status='COMPLETED',post_moisture=%s,result=%s,notes=%s WHERE id=%s",(d.post_moisture,d.result,d.notes,r['id']))
             cur.execute("UPDATE anomaly_lots SET status=%s,resolved_at=CASE WHEN %s THEN now() ELSE NULL END WHERE id=%s",(status,passed,aid))
-            cur.execute("UPDATE bamboo_lots SET status=%s WHERE id=%s",('CLEARED' if passed else 'QUARANTINED',a['lot_id']))
+            cur.execute("UPDATE bamboo_lots SET status=%s WHERE id=%s AND status<>'RELEASED'",('CLEARED' if passed else 'QUARANTINED',a['lot_id']))
     return {'status':status,'recheck_id':r['id']}
 
 @app.get('/releases')
@@ -135,12 +155,60 @@ def releases(u=Depends(roles('operator','supervisor','viewer'))):
 
 @app.post('/releases/lots/{lot_id}')
 def release(lot_id:int,d:ReleaseIn,u=Depends(roles('supervisor'))):
-    l=one('SELECT * FROM bamboo_lots WHERE id=%s',(lot_id,)); a=one('SELECT * FROM anomaly_lots WHERE lot_id=%s',(lot_id,))
-    if not l: raise HTTPException(404,'批次不存在')
-    if a and a['status'] not in ('CLEARED','REJECTED'): raise HTTPException(409,'异常批次尚未完成窑干复测，不能出库')
-    if d.decision=='RELEASE' and a and a['status']=='REJECTED': raise HTTPException(409,'复测未通过，不能放行')
     with conn() as c:
-        with c.cursor() as cur:
+        with c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('SELECT * FROM bamboo_lots WHERE id=%s FOR UPDATE',(lot_id,)); l=cur.fetchone()
+            if not l: raise HTTPException(404,'批次不存在')
+            cur.execute('SELECT * FROM anomaly_lots WHERE lot_id=%s',(lot_id,)); a=cur.fetchone()
+            if l['status']=='RELEASED': raise HTTPException(409,'批次已出库，保留原放行决定')
+            if a and a['status'] not in ('CLEARED','REJECTED'): raise HTTPException(409,'异常批次尚未完成窑干复测，不能出库')
+            if d.decision=='RELEASE' and a and a['status']=='REJECTED': raise HTTPException(409,'复测未通过，不能放行')
+            if d.decision=='RELEASE':
+                block=calib.release_block(cur,lot_id)
+                if block: raise HTTPException(409,f'校准追查未闭环，不能出库：{block["reason"]}')
             cur.execute('INSERT INTO release_decisions(lot_id,anomaly_id,decision,reason,decided_by) VALUES(%s,%s,%s,%s,%s)',(lot_id,a['id'] if a else None,d.decision,d.reason,u['id']))
             cur.execute("UPDATE bamboo_lots SET status=%s WHERE id=%s",('RELEASED' if d.decision=='RELEASE' else 'QUARANTINED',lot_id))
     return {'lot_id':lot_id,'decision':d.decision}
+
+@app.post('/calibrations')
+def register_calibration(d:CalibrationIn,u=Depends(roles('supervisor'))):
+    try:
+        start=datetime.fromisoformat(d.window_start.replace('Z','+00:00'))
+        end=datetime.fromisoformat(d.window_end.replace('Z','+00:00'))
+    except ValueError: raise HTTPException(422,'时间格式不正确')
+    if end<=start: raise HTTPException(422,'校准结束时间必须晚于开始时间')
+    if start.tzinfo is None: start=start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None: end=end.replace(tzinfo=timezone.utc)
+    with conn() as c:
+        with c.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("INSERT INTO instrument_calibrations(instrument_id,window_start,window_end,reason,registered_by) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(instrument_id,window_start,window_end) DO NOTHING RETURNING *",(d.instrument_id,start,end,d.reason,u['id']))
+            cal=cur.fetchone()
+            if not cal:
+                cur.execute('SELECT * FROM instrument_calibrations WHERE instrument_id=%s AND window_start=%s AND window_end=%s',(d.instrument_id,start,end))
+                cal=cur.fetchone(); duplicate=True
+            else: duplicate=False
+            summary=calib.apply_calibration(cur,cal)
+    for jid in summary['queued_job_ids']: put(jid)
+    return {'calibration':dict(cal) if cal else None,'duplicate':duplicate,**summary}
+
+@app.post('/calibrations/{cid}/retry')
+def retry_calibration(cid:int,u=Depends(roles('supervisor'))):
+    with conn() as c:
+        with c.cursor(cursor_factory=RealDictCursor) as cur:
+            cal=calib.load_calibration(cur,cid)
+            if not cal: raise HTTPException(404,'校准登记不存在')
+            summary=calib.apply_calibration(cur,cal)
+            pending=calib.requeue_pending(cur,cid)
+    for jid in sorted(set(summary['queued_job_ids'])|set(pending)): put(jid)
+    return {'calibration_id':cid,**summary,'requeued_job_ids':pending}
+
+@app.get('/calibrations')
+def list_calibrations(u=Depends(roles('operator','supervisor','viewer'))):
+    rows=all_rows("SELECT c.*,count(t.id) trace_count,count(t.id) FILTER(WHERE t.disposition IN('RECOMPUTING','HELD')) open_traces FROM instrument_calibrations c LEFT JOIN calibration_traces t ON t.calibration_id=c.id GROUP BY c.id ORDER BY c.registered_at DESC")
+    return [dict(x) for x in rows]
+
+@app.get('/calibrations/{cid}/traces')
+def calibration_traces(cid:int,u=Depends(roles('operator','supervisor','viewer'))):
+    if not one('SELECT id FROM instrument_calibrations WHERE id=%s',(cid,)): raise HTTPException(404,'校准登记不存在')
+    rows=all_rows("SELECT t.*,l.lot_code,l.origin,l.status lot_status,j.kind job_kind,j.status job_status,j.result job_result FROM calibration_traces t JOIN bamboo_lots l ON l.id=t.lot_id LEFT JOIN analysis_jobs j ON j.id=t.job_id WHERE t.calibration_id=%s ORDER BY t.id",(cid,))
+    return [dict(x) for x in rows]
